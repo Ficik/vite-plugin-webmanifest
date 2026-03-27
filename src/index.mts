@@ -46,7 +46,11 @@ export type WebManifest = {
  * Plugin configuration options
  */
 export type WebManifestPluginOptions = {
-    // No options currently available
+    /**
+     * HTML entry points to process. Defaults to ['index.html'].
+     * Each entry point's manifest will be processed independently.
+     */
+    entrypoints?: string[];
 };
 
 /**
@@ -94,27 +98,22 @@ function buildManifestHref(base: string, manifestFileName: string): string {
 }
 
 /**
- * Update HTML files to reference the root manifest
+ * Update an HTML file to reference the root manifest
  */
 async function updateHtmlManifestLinks(
-    outputDir: string,
+    htmlFilePath: string,
     base: string,
     manifestFileName: string
 ): Promise<void> {
-    const indexPath = path.join(outputDir, 'index.html');
-
-    if (existsSync(indexPath)) {
+    if (existsSync(htmlFilePath)) {
         try {
-            const htmlContent = await readFile(indexPath, 'utf-8');
+            const htmlContent = await readFile(htmlFilePath, 'utf-8');
             const $ = load(htmlContent);
             const manifestLink = $(MANIFEST_LINK_SELECTOR);
 
             if (manifestLink.length > 0) {
-                // Update href to point to root manifest
                 manifestLink.attr('href', buildManifestHref(base, manifestFileName));
-
-                // Write updated HTML
-                await writeFile(indexPath, $.html(), 'utf-8');
+                await writeFile(htmlFilePath, $.html(), 'utf-8');
             }
         } catch (error) {
             console.error(
@@ -225,8 +224,8 @@ export const webmanifestPlugin = (_options: WebManifestPluginOptions = {}): Plug
     let base: string = './';
     let root: string = process.cwd();
 
-    // Store manifest file name for writeBundle hook
-    let storedManifestFileName: string | undefined;
+    // Store manifest file names per HTML entry for writeBundle hook
+    const storedManifestMap = new Map<string, string>(); // entrypoint -> manifestFileName in assets
 
     return {
         name: 'vite:webmanifest',
@@ -239,162 +238,147 @@ export const webmanifestPlugin = (_options: WebManifestPluginOptions = {}): Plug
         },
 
         async generateBundle(_, bundle) {
-            // Clear file cache at the start of each build
             fileCache.clear();
+            storedManifestMap.clear();
 
-            // Capture plugin context for use in callbacks
             const pluginContext = this;
+            const entrypoints = _options.entrypoints ?? ['index.html'];
 
-            let manifestPath: string | undefined;
-            let manifestJson: WebManifest = {};
-            const indexPath = path.resolve(root, 'index.html');
+            await Promise.all(
+                entrypoints.map(async (entrypoint) => {
+                    let manifestPath: string | undefined;
+                    const indexPath = path.resolve(root, entrypoint);
 
-            if (exists(indexPath)) {
-                const indexContent = await readFile(indexPath, 'utf-8');
-                const $ = load(indexContent);
-                const manifestLink = $(MANIFEST_LINK_SELECTOR);
+                    if (exists(indexPath)) {
+                        const indexContent = await readFile(indexPath, 'utf-8');
+                        const $ = load(indexContent);
+                        const manifestLink = $(MANIFEST_LINK_SELECTOR);
 
-                if (manifestLink.length > 0) {
-                    const href = manifestLink.attr('href');
-
-                    if (href) {
-                        // Handle absolute paths starting with /
-                        if (href.startsWith('/')) {
-                            manifestPath = path.join(root, href.slice(1));
-                        } else {
-                            manifestPath = path.resolve(root, href);
+                        if (manifestLink.length > 0) {
+                            const href = manifestLink.attr('href');
+                            if (href) {
+                                if (href.startsWith('/')) {
+                                    manifestPath = path.join(root, href.slice(1));
+                                } else {
+                                    manifestPath = path.resolve(root, href);
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            if (!manifestPath || !exists(manifestPath)) {
-                throw new Error(
-                    'WebManifest file not found. Make sure index.html contains <link rel="manifest" href="...">'
-                );
-            }
+                    if (!manifestPath || !exists(manifestPath)) {
+                        pluginContext.error(
+                            `WebManifest file not found for ${entrypoint}. Make sure it contains <link rel="manifest" href="...">`
+                        );
+                        return;
+                    }
 
-            try {
-                const manifestContent = await readFile(manifestPath!, 'utf-8');
-                manifestJson = JSON.parse(manifestContent) as WebManifest;
+                    let manifestJson: WebManifest = {};
+                    try {
+                        const manifestContent = await readFile(manifestPath, 'utf-8');
+                        manifestJson = JSON.parse(manifestContent) as WebManifest;
+                    } catch (error) {
+                        pluginContext.error(
+                            `Failed to parse WebManifest file: ${error instanceof Error ? error.message : String(error)}`
+                        );
+                        return;
+                    }
 
-                // No need to store for writeBundle - we handle everything in generateBundle
-            } catch (error) {
-                this.error(
-                    `Failed to parse WebManifest file: ${error instanceof Error ? error.message : String(error)}`
-                );
-            }
+                    manifestJson.scope = base;
+                    manifestJson.start_url = base;
 
-            // Update scope and start_url
-            manifestJson.scope = base;
-            manifestJson.start_url = base;
+                    const emitFileCallback = async (iconName: string, iconPath: string): Promise<string> => {
+                        const fileId = pluginContext.emitFile({
+                            type: 'asset',
+                            name: iconName,
+                            source: await getCachedFile(iconPath),
+                        });
+                        return `./${pluginContext.getFileName(fileId)}`;
+                    };
 
-            // Callback for emitting files with caching
-            const emitFileCallback = async (
-                iconName: string,
-                iconPath: string
-            ): Promise<string> => {
-                const fileId = this.emitFile({
-                    type: 'asset',
-                    name: iconName,
-                    source: await getCachedFile(iconPath),
-                });
+                    await Promise.all([
+                        emitIcons(manifestJson.icons, root, emitFileCallback, pluginContext),
+                        emitIcons(manifestJson.screenshots, root, emitFileCallback, pluginContext),
+                        emitShortcutIcons(manifestJson.shortcuts, root, emitFileCallback, pluginContext),
+                    ]);
 
-                const fileName = this.getFileName(fileId);
+                    if (manifestJson.screenshots && manifestJson.screenshots.length === 0) {
+                        delete manifestJson.screenshots;
+                    }
+                    if (manifestJson.shortcuts && manifestJson.shortcuts.length === 0) {
+                        delete manifestJson.shortcuts;
+                    }
 
-                // Keep the full path including 'assets/' prefix for proper asset referencing
-                return `./${fileName}`;
-            };
+                    const manifestExt = path.extname(manifestPath);
+                    const manifestName = path.basename(manifestPath, manifestExt);
+                    const fileId = pluginContext.emitFile({
+                        type: 'asset',
+                        name: `${manifestName}${manifestExt}`,
+                        source: JSON.stringify(manifestJson, null, 4),
+                    });
+                    const manifestfileName = pluginContext.getFileName(fileId);
 
-            // Process all icons in parallel
-            await Promise.all([
-                emitIcons(manifestJson.icons, root, emitFileCallback, pluginContext),
-                emitIcons(manifestJson.screenshots, root, emitFileCallback, pluginContext),
-                emitShortcutIcons(manifestJson.shortcuts, root, emitFileCallback, pluginContext),
-            ]);
+                    storedManifestMap.set(entrypoint, manifestfileName);
+                })
+            );
 
-            // Remove empty arrays to avoid PWA warnings
-            if (manifestJson.screenshots && manifestJson.screenshots.length === 0) {
-                delete manifestJson.screenshots;
-            }
-            if (manifestJson.shortcuts && manifestJson.shortcuts.length === 0) {
-                delete manifestJson.shortcuts;
-            }
+            const emittedManifestNames = new Set(storedManifestMap.values());
 
-            // Get file name of the manifest
-            const manifestExt = path.extname(manifestPath);
-            const manifestName = path.basename(manifestPath, manifestExt);
-            const manifestContent = JSON.stringify(manifestJson, null, 4);
-
-            let manifestfileName: string;
-
-            // Always emit with name to get hashing, then adjust path in HTML
-            const fileId = this.emitFile({
-                type: 'asset',
-                name: `${manifestName}${manifestExt}`,
-                source: manifestContent,
-            });
-            manifestfileName = this.getFileName(fileId);
-
-            // Store for writeBundle hook to move manifest to root
-            storedManifestFileName = manifestfileName;
-
-            // Single pass through bundle: update HTML and remove old manifest
             for (const fileName in bundle) {
                 const fileChunk = bundle[fileName];
 
-                // Update HTML files to reference the hashed manifest file
                 if (
                     fileName.endsWith(HTML_EXTENSION) &&
                     fileChunk.type === 'asset' &&
                     typeof fileChunk.source === 'string'
                 ) {
-                    const $ = load(fileChunk.source);
-                    const manifestLink = $(MANIFEST_LINK_SELECTOR);
-
-                    if (manifestLink.length > 0) {
-                        manifestLink.attr('href', buildManifestHref(base, manifestfileName));
-                        fileChunk.source = $.html();
+                    const manifestfileName = storedManifestMap.get(fileName);
+                    if (manifestfileName) {
+                        const $ = load(fileChunk.source);
+                        const manifestLink = $(MANIFEST_LINK_SELECTOR);
+                        if (manifestLink.length > 0) {
+                            manifestLink.attr('href', buildManifestHref(base, manifestfileName));
+                            fileChunk.source = $.html();
+                        }
                     }
                 }
 
-                // Remove the old manifest from the bundle
-                if (fileName.endsWith(manifestExt) && fileName !== manifestfileName) {
+                // Remove original manifest files from bundle
+                if (fileName.endsWith('.json') && !emittedManifestNames.has(fileName)) {
                     // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
                     delete bundle[fileName];
                 }
             }
 
-            // Clear caches after bundle is complete
             fileCache.clear();
             pathCache.clear();
         },
 
         async writeBundle(options) {
-            if (!storedManifestFileName) {
-                return;
-            }
+            if (storedManifestMap.size === 0) return;
 
             const outputDir = options.dir || 'dist';
-            const assetsManifestPath = path.join(outputDir, storedManifestFileName);
 
-            try {
-                if (!existsSync(assetsManifestPath)) {
-                    return;
-                }
+            await Promise.all(
+                [...storedManifestMap.entries()].map(async ([entrypoint, assetManifestPath]) => {
+                    const assetsManifestAbsPath = path.join(outputDir, assetManifestPath);
+                    try {
+                        if (!existsSync(assetsManifestAbsPath)) return;
 
-                const manifestFileName = storedManifestFileName.replace(/^assets\//, '');
-                const rootManifestPath = path.join(outputDir, manifestFileName);
+                        const manifestFileName = assetManifestPath.replace(/^assets\//, '');
+                        const rootManifestPath = path.join(outputDir, manifestFileName);
 
-                const manifestContent = await readFile(assetsManifestPath, 'utf-8');
-                await writeFile(rootManifestPath, manifestContent, 'utf-8');
-                await updateHtmlManifestLinks(outputDir, base, manifestFileName);
-                await unlink(assetsManifestPath);
-            } catch (error) {
-                console.error(
-                    `❌ Failed to move manifest: ${error instanceof Error ? error.message : String(error)}`
-                );
-            }
+                        const manifestContent = await readFile(assetsManifestAbsPath, 'utf-8');
+                        await writeFile(rootManifestPath, manifestContent, 'utf-8');
+                        await updateHtmlManifestLinks(path.join(outputDir, entrypoint), base, manifestFileName);
+                        await unlink(assetsManifestAbsPath);
+                    } catch (error) {
+                        console.error(
+                            `❌ Failed to move manifest: ${error instanceof Error ? error.message : String(error)}`
+                        );
+                    }
+                })
+            );
         },
     };
 };
